@@ -522,13 +522,16 @@ fun ParserScreen(modifier: Modifier = Modifier, activity: MainActivity, parser: 
                     statusText = "CDN error, restarting..."
                     val iframe = parser.lastIframeUrl
                     if (iframe.isNotBlank()) {
-                        // Save position, quality and play state before restart
                         activity.exoPlayer?.let { p ->
                             resumePositionMs = p.currentPosition
-                            resumePlayWhenReady = p.playWhenReady
-                            Log.d("AllohaPlayer", "Saving position: ${resumePositionMs}ms quality: $qualityKey playing: $resumePlayWhenReady")
+                            Log.d("AllohaPlayer", "Saving position: ${resumePositionMs}ms quality: $qualityKey")
                         }
+                        // Always force playback after recovery
+                        resumePlayWhenReady = true
                         resumeQualityKey = qualityKey
+                        // Release dead player to free codec resources
+                        activity.exoPlayer?.release()
+                        activity.exoPlayer = null
                         coroutineScope.launch {
                             kotlinx.coroutines.delay(1000)
                             parseStream(iframe, isRestart = true)
@@ -592,252 +595,252 @@ fun ParserScreen(modifier: Modifier = Modifier, activity: MainActivity, parser: 
     }
 
     Box(modifier = modifier.fillMaxSize()) {
-    Column(modifier = Modifier.padding(16.dp).fillMaxSize().verticalScroll(rememberScrollState())) {
+        Column(modifier = Modifier.padding(16.dp).fillMaxSize().verticalScroll(rememberScrollState())) {
 
-        Box(modifier = Modifier.size(10.dp).alpha(0.01f)) {
-            AndroidView(factory = { parser.webView })
-        }
-
-        OutlinedTextField(
-            value = tokenInput,
-            onValueChange = { tokenInput = it },
-            label = { Text("Alloha Token") },
-            modifier = Modifier.fillMaxWidth(),
-            colors = OutlinedTextFieldDefaults.colors()
-        )
-        Spacer(modifier = Modifier.height(8.dp))
-        OutlinedTextField(
-            value = kpInput,
-            onValueChange = { kpInput = it.filter { ch -> ch.isDigit() } },
-            label = { Text("KP ID") },
-            modifier = Modifier.fillMaxWidth(),
-            colors = OutlinedTextFieldDefaults.colors()
-        )
-        Spacer(modifier = Modifier.height(8.dp))
-
-        Button(
-            modifier = Modifier.fillMaxWidth(),
-            onClick = {
-                if (tokenInput.isBlank() || kpInput.isBlank()) return@Button
-                coroutineScope.launch {
-                    statusText = "Fetching API data..."
-                    apiResult = null
-                    availableQualities = emptyMap()
-                    showPlayer = false
-                    activity.exoPlayer?.stop()
-
-                    try {
-                        val encodedToken = URLEncoder.encode(tokenInput.trim(), "UTF-8")
-                        val encodedKp = URLEncoder.encode(kpInput.trim(), "UTF-8")
-                        val apiUrl = "https://api.alloha.tv/?token=$encodedToken&kp=$encodedKp"
-
-                        val jsonStr = withContext(Dispatchers.IO) {
-                            val connection = URL(apiUrl).openConnection() as HttpsURLConnection
-                            val trustAllCerts = arrayOf<TrustManager>(object : X509TrustManager {
-                                override fun getAcceptedIssuers(): Array<X509Certificate> = emptyArray()
-                                override fun checkClientTrusted(certs: Array<X509Certificate>?, authType: String?) {}
-                                override fun checkServerTrusted(certs: Array<X509Certificate>?, authType: String?) {}
-                            })
-                            val sc = SSLContext.getInstance("TLS")
-                            sc.init(null, trustAllCerts, SecureRandom())
-                            connection.sslSocketFactory = sc.socketFactory
-                            connection.hostnameVerifier = HostnameVerifier { _, _ -> true }
-                            connection.requestMethod = "GET"
-                            connection.inputStream.bufferedReader().readText()
-                        }
-
-                        val dataObj = JSONObject(jsonStr).getJSONObject("data")
-                        val title = dataObj.optString("name", "Unknown")
-                        val seasonsObj = dataObj.optJSONObject("seasons")
-
-                        if (seasonsObj != null) {
-                            val parsedSeasons = mutableListOf<SeasonInfo>()
-                            seasonsObj.keys().forEach { sKey ->
-                                val sObj = seasonsObj.getJSONObject(sKey)
-                                val episodesObj = sObj.optJSONObject("episodes") ?: return@forEach
-                                val parsedEpisodes = mutableListOf<EpisodeInfo>()
-
-                                episodesObj.keys().forEach { eKey ->
-                                    val eObj = episodesObj.getJSONObject(eKey)
-                                    val transObj = eObj.optJSONObject("translation") ?: return@forEach
-                                    val parsedTrans = mutableListOf<TranslationInfo>()
-
-                                    transObj.keys().forEach { tKey ->
-                                        val tData = transObj.getJSONObject(tKey)
-                                        parsedTrans.add(
-                                            TranslationInfo(
-                                                id = tKey,
-                                                name = tData.optString("translation", "Unknown"),
-                                                iframeUrl = tData.optString("iframe")
-                                            )
-                                        )
-                                    }
-                                    parsedEpisodes.add(EpisodeInfo(eKey, parsedTrans.sortedBy { it.name }))
-                                }
-                                parsedSeasons.add(SeasonInfo(sKey, parsedEpisodes.sortedBy { it.num.toIntOrNull() ?: 0 }))
-                            }
-
-                            val sortedSeasons = parsedSeasons.sortedBy { it.num.toIntOrNull() ?: 0 }
-                            apiResult = AllohaApiResult(title, true, null, sortedSeasons)
-                            selectedSeason = sortedSeasons.firstOrNull()
-                            selectedEpisode = selectedSeason?.episodes?.firstOrNull()
-                            selectedTranslation = selectedEpisode?.translations?.firstOrNull()
-                            statusText = "Series loaded. Select episode."
-                        } else {
-                            val iframe = dataObj.getString("iframe")
-                            apiResult = AllohaApiResult(title, false, iframe, emptyList())
-                            statusText = "Movie loaded. Click Get Links."
-                        }
-                    } catch (e: Exception) {
-                        statusText = "API Error: ${e.message}"
-                    }
-                }
+            Box(modifier = Modifier.size(10.dp).alpha(0.01f)) {
+                AndroidView(factory = { parser.webView })
             }
-        ) {
-            Text("Fetch Info", color = MaterialTheme.colorScheme.onPrimary)
-        }
 
-        Spacer(modifier = Modifier.height(16.dp))
-
-        apiResult?.let { res ->
-            Text("Title: ${res.title}", style = MaterialTheme.typography.titleMedium, color = MaterialTheme.colorScheme.onBackground)
+            OutlinedTextField(
+                value = tokenInput,
+                onValueChange = { tokenInput = it },
+                label = { Text("Alloha Token") },
+                modifier = Modifier.fillMaxWidth(),
+                colors = OutlinedTextFieldDefaults.colors()
+            )
+            Spacer(modifier = Modifier.height(8.dp))
+            OutlinedTextField(
+                value = kpInput,
+                onValueChange = { kpInput = it.filter { ch -> ch.isDigit() } },
+                label = { Text("KP ID") },
+                modifier = Modifier.fillMaxWidth(),
+                colors = OutlinedTextFieldDefaults.colors()
+            )
             Spacer(modifier = Modifier.height(8.dp))
 
-            if (res.isSerial) {
-                var sExpanded by remember { mutableStateOf(false) }
-                ExposedDropdownMenuBox(expanded = sExpanded, onExpandedChange = { sExpanded = it }) {
-                    @Suppress("DEPRECATION")
-                    OutlinedTextField(
-                        value = "Season ${selectedSeason?.num ?: ""}",
-                        onValueChange = {},
-                        readOnly = true,
-                        modifier = Modifier.menuAnchor().fillMaxWidth(),
-                        label = { Text("Season") },
-                        trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = sExpanded) },
-                        colors = ExposedDropdownMenuDefaults.outlinedTextFieldColors()
-                    )
-                    ExposedDropdownMenu(expanded = sExpanded, onDismissRequest = { sExpanded = false }) {
-                        res.seasons.forEach { s ->
-                            DropdownMenuItem(
-                                text = { Text("Season ${s.num}") },
-                                onClick = {
-                                    selectedSeason = s
-                                    selectedEpisode = s.episodes.firstOrNull()
-                                    selectedTranslation = selectedEpisode?.translations?.firstOrNull()
-                                    sExpanded = false
+            Button(
+                modifier = Modifier.fillMaxWidth(),
+                onClick = {
+                    if (tokenInput.isBlank() || kpInput.isBlank()) return@Button
+                    coroutineScope.launch {
+                        statusText = "Fetching API data..."
+                        apiResult = null
+                        availableQualities = emptyMap()
+                        showPlayer = false
+                        activity.exoPlayer?.stop()
+
+                        try {
+                            val encodedToken = URLEncoder.encode(tokenInput.trim(), "UTF-8")
+                            val encodedKp = URLEncoder.encode(kpInput.trim(), "UTF-8")
+                            val apiUrl = "https://api.alloha.tv/?token=$encodedToken&kp=$encodedKp"
+
+                            val jsonStr = withContext(Dispatchers.IO) {
+                                val connection = URL(apiUrl).openConnection() as HttpsURLConnection
+                                val trustAllCerts = arrayOf<TrustManager>(object : X509TrustManager {
+                                    override fun getAcceptedIssuers(): Array<X509Certificate> = emptyArray()
+                                    override fun checkClientTrusted(certs: Array<X509Certificate>?, authType: String?) {}
+                                    override fun checkServerTrusted(certs: Array<X509Certificate>?, authType: String?) {}
+                                })
+                                val sc = SSLContext.getInstance("TLS")
+                                sc.init(null, trustAllCerts, SecureRandom())
+                                connection.sslSocketFactory = sc.socketFactory
+                                connection.hostnameVerifier = HostnameVerifier { _, _ -> true }
+                                connection.requestMethod = "GET"
+                                connection.inputStream.bufferedReader().readText()
+                            }
+
+                            val dataObj = JSONObject(jsonStr).getJSONObject("data")
+                            val title = dataObj.optString("name", "Unknown")
+                            val seasonsObj = dataObj.optJSONObject("seasons")
+
+                            if (seasonsObj != null) {
+                                val parsedSeasons = mutableListOf<SeasonInfo>()
+                                seasonsObj.keys().forEach { sKey ->
+                                    val sObj = seasonsObj.getJSONObject(sKey)
+                                    val episodesObj = sObj.optJSONObject("episodes") ?: return@forEach
+                                    val parsedEpisodes = mutableListOf<EpisodeInfo>()
+
+                                    episodesObj.keys().forEach { eKey ->
+                                        val eObj = episodesObj.getJSONObject(eKey)
+                                        val transObj = eObj.optJSONObject("translation") ?: return@forEach
+                                        val parsedTrans = mutableListOf<TranslationInfo>()
+
+                                        transObj.keys().forEach { tKey ->
+                                            val tData = transObj.getJSONObject(tKey)
+                                            parsedTrans.add(
+                                                TranslationInfo(
+                                                    id = tKey,
+                                                    name = tData.optString("translation", "Unknown"),
+                                                    iframeUrl = tData.optString("iframe")
+                                                )
+                                            )
+                                        }
+                                        parsedEpisodes.add(EpisodeInfo(eKey, parsedTrans.sortedBy { it.name }))
+                                    }
+                                    parsedSeasons.add(SeasonInfo(sKey, parsedEpisodes.sortedBy { it.num.toIntOrNull() ?: 0 }))
                                 }
-                            )
+
+                                val sortedSeasons = parsedSeasons.sortedBy { it.num.toIntOrNull() ?: 0 }
+                                apiResult = AllohaApiResult(title, true, null, sortedSeasons)
+                                selectedSeason = sortedSeasons.firstOrNull()
+                                selectedEpisode = selectedSeason?.episodes?.firstOrNull()
+                                selectedTranslation = selectedEpisode?.translations?.firstOrNull()
+                                statusText = "Series loaded. Select episode."
+                            } else {
+                                val iframe = dataObj.getString("iframe")
+                                apiResult = AllohaApiResult(title, false, iframe, emptyList())
+                                statusText = "Movie loaded. Click Get Links."
+                            }
+                        } catch (e: Exception) {
+                            statusText = "API Error: ${e.message}"
                         }
                     }
                 }
+            ) {
+                Text("Fetch Info", color = MaterialTheme.colorScheme.onPrimary)
+            }
+
+            Spacer(modifier = Modifier.height(16.dp))
+
+            apiResult?.let { res ->
+                Text("Title: ${res.title}", style = MaterialTheme.typography.titleMedium, color = MaterialTheme.colorScheme.onBackground)
                 Spacer(modifier = Modifier.height(8.dp))
 
-                var eExpanded by remember { mutableStateOf(false) }
-                ExposedDropdownMenuBox(expanded = eExpanded, onExpandedChange = { eExpanded = it }) {
-                    @Suppress("DEPRECATION")
-                    OutlinedTextField(
-                        value = "Episode ${selectedEpisode?.num ?: ""}",
-                        onValueChange = {},
-                        readOnly = true,
-                        modifier = Modifier.menuAnchor().fillMaxWidth(),
-                        label = { Text("Episode") },
-                        trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = eExpanded) },
-                        colors = ExposedDropdownMenuDefaults.outlinedTextFieldColors()
-                    )
-                    ExposedDropdownMenu(expanded = eExpanded, onDismissRequest = { eExpanded = false }) {
-                        selectedSeason?.episodes?.forEach { e ->
-                            DropdownMenuItem(
-                                text = { Text("Episode ${e.num}") },
-                                onClick = {
-                                    selectedEpisode = e
-                                    selectedTranslation = e.translations.firstOrNull()
-                                    eExpanded = false
-                                }
-                            )
+                if (res.isSerial) {
+                    var sExpanded by remember { mutableStateOf(false) }
+                    ExposedDropdownMenuBox(expanded = sExpanded, onExpandedChange = { sExpanded = it }) {
+                        @Suppress("DEPRECATION")
+                        OutlinedTextField(
+                            value = "Season ${selectedSeason?.num ?: ""}",
+                            onValueChange = {},
+                            readOnly = true,
+                            modifier = Modifier.menuAnchor().fillMaxWidth(),
+                            label = { Text("Season") },
+                            trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = sExpanded) },
+                            colors = ExposedDropdownMenuDefaults.outlinedTextFieldColors()
+                        )
+                        ExposedDropdownMenu(expanded = sExpanded, onDismissRequest = { sExpanded = false }) {
+                            res.seasons.forEach { s ->
+                                DropdownMenuItem(
+                                    text = { Text("Season ${s.num}") },
+                                    onClick = {
+                                        selectedSeason = s
+                                        selectedEpisode = s.episodes.firstOrNull()
+                                        selectedTranslation = selectedEpisode?.translations?.firstOrNull()
+                                        sExpanded = false
+                                    }
+                                )
+                            }
                         }
                     }
-                }
-                Spacer(modifier = Modifier.height(8.dp))
+                    Spacer(modifier = Modifier.height(8.dp))
 
-                var tExpanded by remember { mutableStateOf(false) }
-                ExposedDropdownMenuBox(expanded = tExpanded, onExpandedChange = { tExpanded = it }) {
-                    @Suppress("DEPRECATION")
-                    OutlinedTextField(
-                        value = selectedTranslation?.name ?: "",
-                        onValueChange = {},
-                        readOnly = true,
-                        modifier = Modifier.menuAnchor().fillMaxWidth(),
-                        label = { Text("Voice / Translation") },
-                        trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = tExpanded) },
-                        colors = ExposedDropdownMenuDefaults.outlinedTextFieldColors()
-                    )
-                    ExposedDropdownMenu(expanded = tExpanded, onDismissRequest = { tExpanded = false }) {
-                        selectedEpisode?.translations?.forEach { t ->
-                            DropdownMenuItem(
-                                text = { Text(t.name) },
-                                onClick = {
-                                    selectedTranslation = t
-                                    tExpanded = false
-                                }
-                            )
+                    var eExpanded by remember { mutableStateOf(false) }
+                    ExposedDropdownMenuBox(expanded = eExpanded, onExpandedChange = { eExpanded = it }) {
+                        @Suppress("DEPRECATION")
+                        OutlinedTextField(
+                            value = "Episode ${selectedEpisode?.num ?: ""}",
+                            onValueChange = {},
+                            readOnly = true,
+                            modifier = Modifier.menuAnchor().fillMaxWidth(),
+                            label = { Text("Episode") },
+                            trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = eExpanded) },
+                            colors = ExposedDropdownMenuDefaults.outlinedTextFieldColors()
+                        )
+                        ExposedDropdownMenu(expanded = eExpanded, onDismissRequest = { eExpanded = false }) {
+                            selectedSeason?.episodes?.forEach { e ->
+                                DropdownMenuItem(
+                                    text = { Text("Episode ${e.num}") },
+                                    onClick = {
+                                        selectedEpisode = e
+                                        selectedTranslation = e.translations.firstOrNull()
+                                        eExpanded = false
+                                    }
+                                )
+                            }
+                        }
+                    }
+                    Spacer(modifier = Modifier.height(8.dp))
+
+                    var tExpanded by remember { mutableStateOf(false) }
+                    ExposedDropdownMenuBox(expanded = tExpanded, onExpandedChange = { tExpanded = it }) {
+                        @Suppress("DEPRECATION")
+                        OutlinedTextField(
+                            value = selectedTranslation?.name ?: "",
+                            onValueChange = {},
+                            readOnly = true,
+                            modifier = Modifier.menuAnchor().fillMaxWidth(),
+                            label = { Text("Voice / Translation") },
+                            trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = tExpanded) },
+                            colors = ExposedDropdownMenuDefaults.outlinedTextFieldColors()
+                        )
+                        ExposedDropdownMenu(expanded = tExpanded, onDismissRequest = { tExpanded = false }) {
+                            selectedEpisode?.translations?.forEach { t ->
+                                DropdownMenuItem(
+                                    text = { Text(t.name) },
+                                    onClick = {
+                                        selectedTranslation = t
+                                        tExpanded = false
+                                    }
+                                )
+                            }
+                        }
+                    }
+                    Spacer(modifier = Modifier.height(16.dp))
+
+                    Button(
+                        modifier = Modifier.fillMaxWidth(),
+                        onClick = { selectedTranslation?.iframeUrl?.let { parseStream(it) } }
+                    ) { Text("Get Links", color = MaterialTheme.colorScheme.onPrimary) }
+                } else {
+                    Button(
+                        modifier = Modifier.fillMaxWidth(),
+                        onClick = { res.movieIframe?.let { parseStream(it) } }
+                    ) { Text("Get Links", color = MaterialTheme.colorScheme.onPrimary) }
+                }
+            }
+
+            Spacer(modifier = Modifier.height(16.dp))
+            Text(text = statusText, color = MaterialTheme.colorScheme.primary)
+            Spacer(modifier = Modifier.height(16.dp))
+
+            if (availableQualities.isNotEmpty()) {
+                Text("Select Quality:", color = MaterialTheme.colorScheme.onBackground)
+                Spacer(modifier = Modifier.height(8.dp))
+                @kotlin.OptIn(ExperimentalLayoutApi::class)
+                FlowRow(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    listOf("2160", "1440", "1080", "720", "480", "360").forEach { q ->
+                        availableQualities[q]?.let { url ->
+                            Button(onClick = { playQuality(url, q) }) {
+                                Text("${q}p", color = MaterialTheme.colorScheme.onPrimary)
+                            }
                         }
                     }
                 }
                 Spacer(modifier = Modifier.height(16.dp))
-
-                Button(
-                    modifier = Modifier.fillMaxWidth(),
-                    onClick = { selectedTranslation?.iframeUrl?.let { parseStream(it) } }
-                ) { Text("Get Links", color = MaterialTheme.colorScheme.onPrimary) }
-            } else {
-                Button(
-                    modifier = Modifier.fillMaxWidth(),
-                    onClick = { res.movieIframe?.let { parseStream(it) } }
-                ) { Text("Get Links", color = MaterialTheme.colorScheme.onPrimary) }
             }
-        }
 
-        Spacer(modifier = Modifier.height(16.dp))
-        Text(text = statusText, color = MaterialTheme.colorScheme.primary)
-        Spacer(modifier = Modifier.height(16.dp))
-
-        if (availableQualities.isNotEmpty()) {
-            Text("Select Quality:", color = MaterialTheme.colorScheme.onBackground)
-            Spacer(modifier = Modifier.height(8.dp))
-            @kotlin.OptIn(ExperimentalLayoutApi::class)
-            FlowRow(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
-                verticalArrangement = Arrangement.spacedBy(8.dp)
-            ) {
-                listOf("2160", "1440", "1080", "720", "480", "360").forEach { q ->
-                    availableQualities[q]?.let { url ->
-                        Button(onClick = { playQuality(url, q) }) {
-                            Text("${q}p", color = MaterialTheme.colorScheme.onPrimary)
-                        }
-                    }
-                }
+            if (showPlayer && !isFullscreen) {
+                AndroidView(
+                    factory = { playerView },
+                    update = { it.player = activity.exoPlayer },
+                    modifier = Modifier.fillMaxWidth().aspectRatio(16f / 9f)
+                )
             }
-            Spacer(modifier = Modifier.height(16.dp))
-        }
 
-        if (showPlayer && !isFullscreen) {
+            Spacer(modifier = Modifier.height(50.dp))
+        } // end Column
+
+        if (isFullscreen && showPlayer) {
             AndroidView(
                 factory = { playerView },
                 update = { it.player = activity.exoPlayer },
-                modifier = Modifier.fillMaxWidth().aspectRatio(16f / 9f)
+                modifier = Modifier.fillMaxSize()
             )
         }
-
-        Spacer(modifier = Modifier.height(50.dp))
-    } // end Column
-
-    if (isFullscreen && showPlayer) {
-        AndroidView(
-            factory = { playerView },
-            update = { it.player = activity.exoPlayer },
-            modifier = Modifier.fillMaxSize()
-        )
-    }
     } // end Box
 }
