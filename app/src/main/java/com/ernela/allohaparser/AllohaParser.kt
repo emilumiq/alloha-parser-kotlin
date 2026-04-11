@@ -20,8 +20,33 @@ import java.util.Locale
 
 class AllohaParser(context: Context) {
 
-    private val userAgent =
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36"
+    private val userAgents = (0..19).map {
+        val os = listOf(
+            "Windows NT 10.0; Win64; x64",
+            "Windows NT 11.0; Win64; x64",
+            "Macintosh; Intel Mac OS X 10_15_7",
+            "Macintosh; Intel Mac OS X 14_4_1",
+            "X11; Linux x86_64",
+            "X11; Ubuntu; Linux x86_64",
+        ).random()
+        val cv = (130..135).random()
+        val fv = (130..136).random()
+        when ((0..2).random()) {
+            0 -> "Mozilla/5.0 ($os) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/$cv.0.0.0 Safari/537.36"
+            1 -> "Mozilla/5.0 ($os; rv:$fv.0) Gecko/20100101 Firefox/$fv.0"
+            else -> "Mozilla/5.0 ($os) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/$cv.0.0.0 Safari/537.36 Edg/$cv.0.0.0"
+        }
+    }
+    private var uaIndex = userAgents.indices.random()
+    private val userAgent get() = userAgents[uaIndex]
+
+    var lastIframeUrl: String = ""
+
+    fun rotateUserAgent() {
+        uaIndex = (uaIndex + 1) % userAgents.size
+        webView.settings.userAgentString = userAgent
+        Log.d("AllohaParser", "UA rotated to: ${userAgent.take(60)}")
+    }
 
     val webView: WebView = WebView(context).apply {
         settings.javaScriptEnabled = true
@@ -65,6 +90,7 @@ class AllohaParser(context: Context) {
 
     @SuppressLint("AddJavascriptInterface")
     fun parse(iframeUrl: String, callback: Callback) {
+        lastIframeUrl = iframeUrl
         Handler(Looper.getMainLooper()).post {
             webView.onResume()
             webView.resumeTimers()

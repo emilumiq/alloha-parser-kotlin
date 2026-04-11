@@ -57,11 +57,12 @@ data class AllohaApiResult(
 class MainActivity : ComponentActivity() {
     var exoPlayer: ExoPlayer? = null
     var parser: AllohaParser? = null
+    lateinit var hlsProxy: HlsProxyServer
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         parser = AllohaParser(this)
-
+        // proxy is initialized after activeHeaders are available — see ParserScreen
         enableEdgeToEdge()
         setContent {
             AllohaParserTheme {
@@ -86,6 +87,7 @@ class MainActivity : ComponentActivity() {
         exoPlayer?.release()
         exoPlayer = null
         parser?.release()
+        if (::hlsProxy.isInitialized) hlsProxy.stop()
     }
 }
 
@@ -107,42 +109,88 @@ fun ParserScreen(modifier: Modifier = Modifier, activity: MainActivity, parser: 
     var availableQualities by remember { mutableStateOf<Map<String, String>>(emptyMap()) }
     var currentIframeBase by remember { mutableStateOf("") }
     var showPlayer by remember { mutableStateOf(false) }
+    var isFullscreen by remember { mutableStateOf(false) }
 
     val activeHeaders = remember { ConcurrentHashMap<String, String>() }
+
+    // Callback for proxy to trigger forced session restart (set after parseStream is defined)
+    val onSessionExpiredRef = remember { mutableStateOf<(() -> Unit)?>(null) }
+
+    // Start HLS proxy once, sharing the same activeHeaders map
+    val hlsProxy = remember {
+        HlsProxyServer(activeHeaders, onSessionExpired = {
+            onSessionExpiredRef.value?.invoke()
+        }).also {
+            activity.hlsProxy = it
+            it.start()
+        }
+    }
+
     var currentDataSourceFactory by remember { mutableStateOf<OkHttpDataSource.Factory?>(null) }
     var currentM3u8Url by remember { mutableStateOf("") }
     var fallbackM3u8Url by remember { mutableStateOf("") }
     var configUpdateReceived by remember { mutableStateOf(false) }
+    var isProactiveRestart by remember { mutableStateOf(false) }
+    var resumePositionMs by remember { mutableStateOf(0L) }
+    var resumeQualityKey by remember { mutableStateOf("") }
+    var resumePlayWhenReady by remember { mutableStateOf(true) }
+    // TTL watchdog: restart session before config_update expires
+    var configUpdateTtlMs by remember { mutableStateOf(0L) } // absolute time when TTL expires
+    var proactiveRestartJob by remember { mutableStateOf<kotlinx.coroutines.Job?>(null) }
 
     fun switchMediaSource(m3u8Url: String) {
         val factory = currentDataSourceFactory ?: return
         val player = activity.exoPlayer ?: return
-        val position = player.currentPosition
         val wasPlaying = player.playWhenReady
 
+        // Update proxy's active master URL — ExoPlayer keeps using the fixed localhost URL
+        activity.hlsProxy.updateMasterUrl(m3u8Url)
+        val proxiedUrl = activity.hlsProxy.fixedMasterUrl
+
         val mediaItem = MediaItem.Builder()
-            .setUri(m3u8Url)
+            .setUri(proxiedUrl)
             .setMimeType(MimeTypes.APPLICATION_M3U8)
             .build()
         val hlsSource = HlsMediaSource.Factory(factory).createMediaSource(mediaItem)
 
-        player.setMediaSource(hlsSource, position)
+        // Use false to avoid resetting position — smoother transition
+        player.setMediaSource(hlsSource, false)
         player.prepare()
         player.playWhenReady = wasPlaying
-        Log.d("AllohaPlayer", "MediaSource switched to $m3u8Url at ${position}ms")
+        Log.d("AllohaPlayer", "MediaSource switched to $proxiedUrl (CDN: $m3u8Url)")
     }
 
-    fun buildDataSourceFactory(iframeOrigin: String, traceContext: Context): OkHttpDataSource.Factory {
+    fun buildDataSourceFactory(
+        iframeOrigin: String,
+        traceContext: Context
+    ): OkHttpDataSource.Factory {
+
         val appCtx = traceContext.applicationContext
         val defaultReferer = "$iframeOrigin/"
-        val userAgents = listOf(
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36",
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36",
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36",
-            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36",
-        )
-        var uaIndex = 0
-        val fallbackUa = userAgents[0]
+
+        // Генерация User-Agent
+        fun genUa(): String {
+            val os = listOf(
+                "Windows NT 10.0; Win64; x64",
+                "Windows NT 11.0; Win64; x64",
+                "Macintosh; Intel Mac OS X 10_15_7",
+                "Macintosh; Intel Mac OS X 14_4_1",
+                "X11; Linux x86_64",
+                "X11; Ubuntu; Linux x86_64",
+            ).random()
+
+            val chromeVer = (130..135).random()
+            val ffVer = (130..136).random()
+
+            return when ((0..2).random()) {
+                0 -> "Mozilla/5.0 ($os) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/$chromeVer.0.0.0 Safari/537.36"
+                1 -> "Mozilla/5.0 ($os; rv:$ffVer.0) Gecko/20100101 Firefox/$ffVer.0"
+                else -> "Mozilla/5.0 ($os) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/$chromeVer.0.0.0 Safari/537.36 Edg/$chromeVer.0.0.0"
+            }
+        }
+        val userAgents = (0..19).map { genUa() }
+        var uaIndex = (userAgents.indices).random()
+        val fallbackUa = userAgents[uaIndex]
         val cookieManager = CookieManager.getInstance()
 
         val client = OkHttpClient.Builder()
@@ -198,17 +246,6 @@ fun ParserScreen(modifier: Modifier = Modifier, activity: MainActivity, parser: 
                 val req = requestBuilder.build()
                 try {
                     val response = chain.proceed(req)
-                    // If 403 on CDN — rotate UA and retry once
-                    if (response.code == 403 && req.url.toString().contains("stream-balancer")) {
-                        response.close()
-                        uaIndex = (uaIndex + 1) % userAgents.size
-                        val newUa = userAgents[uaIndex]
-                        Log.d("AllohaPlayer", "403 on CDN, rotating UA to: ${newUa.take(60)}")
-                        val retryReq = req.newBuilder().header("User-Agent", newUa).build()
-                        val retryResp = chain.proceed(retryReq)
-                        AllohaHttpTrace.logOkHttpRoundTrip(appCtx, retryReq, retryResp, null)
-                        return@Interceptor retryResp
-                    }
                     AllohaHttpTrace.logOkHttpRoundTrip(appCtx, req, response, null)
                     response
                 } catch (e: Exception) {
@@ -221,23 +258,49 @@ fun ParserScreen(modifier: Modifier = Modifier, activity: MainActivity, parser: 
                     throw e
                 }
             })
+            // Application interceptor: retry with rotated UA on 403 (allowed to call proceed twice)
+            .addInterceptor(Interceptor { chain ->
+                val response = chain.proceed(chain.request())
+                if (response.code == 403 && chain.request().url.toString().contains("stream-balancer")) {
+                    response.close()
+                    uaIndex = (uaIndex + 1) % userAgents.size
+                    val newUa = userAgents[uaIndex]
+                    Log.d("AllohaPlayer", "403 on CDN, rotating UA to: ${newUa.take(60)}")
+                    chain.proceed(chain.request().newBuilder().header("User-Agent", newUa).build())
+                } else {
+                    response
+                }
+            })
             .build()
 
         return OkHttpDataSource.Factory(client).setUserAgent(fallbackUa)
     }
 
-    fun parseStream(iframe: String) {
-        statusText = "Capturing stream session..."
+    fun parseStream(iframe: String, isRestart: Boolean = false) {
+        if (!isRestart) statusText = "Capturing stream session..."
+        // Don't show status for silent proactive restarts
         availableQualities = emptyMap()
-        showPlayer = false
+        if (!isRestart) showPlayer = false
+        // Register session-expired callback now that parseStream is in scope
+        onSessionExpiredRef.value = {
+            val iframeUrl = parser.lastIframeUrl
+            if (iframeUrl.isNotBlank()) {
+                Log.d("AllohaPlayer", "Proxy: session expired, forcing restart")
+                coroutineScope.launch { parseStream(iframeUrl, isRestart = true) }
+            }
+        }
         fallbackM3u8Url = ""
-        activity.exoPlayer?.stop()
+        // Rotate UA on every session start
+        parser.rotateUserAgent()
+        if (!isRestart) activity.exoPlayer?.stop()
+        // For proactive restart: don't pause — ExoPlayer keeps playing while WebView reloads in background
 
         val parsedUrl = URL(iframe)
         currentIframeBase = "${parsedUrl.protocol}://${parsedUrl.host.lowercase(Locale.ROOT)}"
 
         AllohaHttpTrace.reset(activity.applicationContext)
         configUpdateReceived = false
+        if (!isRestart) isProactiveRestart = false
         currentDataSourceFactory = buildDataSourceFactory(currentIframeBase, activity.applicationContext)
 
         parser.parse(iframe, object : AllohaParser.Callback {
@@ -271,7 +334,13 @@ fun ParserScreen(modifier: Modifier = Modifier, activity: MainActivity, parser: 
                     AllohaHttpTrace.logJsHeaders(activity.applicationContext, "onReady", extraHeaders)
 
                     availableQualities = qualitiesMap
-                    statusText = "Stream captured! Select quality to play."
+                    // Auto-resume if restarting after CDN error — will trigger in onConfigUpdate
+                    if (resumeQualityKey.isNotBlank() && qualitiesMap.containsKey(resumeQualityKey)) {
+                        statusText = "Resuming from ${resumePositionMs / 1000}s..."
+                        // resumeQualityKey/resumePositionMs will be consumed in onConfigUpdate
+                    } else {
+                        statusText = "Stream captured! Select quality to play."
+                    }
                 } catch (e: Exception) {
                     statusText = "Parse Error: ${e.message}"
                 }
@@ -281,13 +350,61 @@ fun ParserScreen(modifier: Modifier = Modifier, activity: MainActivity, parser: 
                 activeHeaders.putAll(extraHeaders)
                 AllohaHttpTrace.logJsHeaders(activity.applicationContext, "config_update", extraHeaders)
                 Log.d("AllohaPlayer", "config_update: headers updated, edge_hash=$edgeHash TTL=${ttlSeconds}s")
+                // Schedule proactive session restart 20s before TTL expires
+                val ttlMs = ttlSeconds * 1000L
+                configUpdateTtlMs = System.currentTimeMillis() + ttlMs
+                proactiveRestartJob?.cancel()
+                proactiveRestartJob = coroutineScope.launch {
+                    kotlinx.coroutines.delay((ttlMs - 20000L).coerceAtLeast(ttlMs / 2))
+                    // Only restart if this TTL is still current and player is active
+                    if (showPlayer && activity.exoPlayer != null &&
+                        System.currentTimeMillis() < configUpdateTtlMs + 5000L) {
+                        val p = activity.exoPlayer!!
+                        resumePositionMs = p.currentPosition
+                        resumePlayWhenReady = p.playWhenReady
+                        resumeQualityKey = "" // keep current quality via currentM3u8Url
+                        Log.d("AllohaPlayer", "Proactive session restart before TTL expiry")
+                        isProactiveRestart = true
+                        parseStream(parser.lastIframeUrl, isRestart = true)
+                    }
+                }
                 statusText = "Stream refreshed (TTL=${ttlSeconds}s)"
                 // First config_update after session start — now safe to play
                 if (!configUpdateReceived) {
                     configUpdateReceived = true
-                    val url = currentM3u8Url
-                    if (url.isNotBlank() && activity.exoPlayer != null && showPlayer) {
-                        switchMediaSource(url)
+                    // Auto-resume after CDN restart
+                    if (resumePositionMs > 0L && currentM3u8Url.isNotBlank()) {
+                        // Proactive restart — headers already updated in activeHeaders,
+                        // ExoPlayer continues playing with new accepts-controls via interceptor
+                        val pos = resumePositionMs
+                        val play = resumePlayWhenReady
+                        resumePositionMs = 0L
+                        resumeQualityKey = ""
+                        showPlayer = true
+                        // Only switch source if URL actually changed (CDN failover)
+                        val newUrl = currentM3u8Url
+                        if (newUrl.isNotBlank() && activity.exoPlayer != null) {
+                            // Don't switch — just let ExoPlayer continue with updated headers
+                            activity.exoPlayer?.playWhenReady = play
+                        }
+                    } else if (resumeQualityKey.isNotBlank() && availableQualities.containsKey(resumeQualityKey)) {
+                        val resumeUrl = availableQualities[resumeQualityKey]!!
+                        val pos = resumePositionMs
+                        resumeQualityKey = ""
+                        resumePositionMs = 0L
+                        currentM3u8Url = resumeUrl
+                        showPlayer = true
+                        switchMediaSource(resumeUrl)
+                        coroutineScope.launch {
+                            kotlinx.coroutines.delay(500)
+                            activity.exoPlayer?.seekTo(pos)
+                            activity.exoPlayer?.playWhenReady = resumePlayWhenReady
+                        }
+                    } else {
+                        val url = currentM3u8Url
+                        if (url.isNotBlank() && activity.exoPlayer != null && showPlayer) {
+                            switchMediaSource(url)
+                        }
                     }
                 }
             }
@@ -311,14 +428,21 @@ fun ParserScreen(modifier: Modifier = Modifier, activity: MainActivity, parser: 
                         coroutineScope.launch {
                             kotlinx.coroutines.delay(10000)
                             if (!configUpdateReceived && currentM3u8Url == url && showPlayer && activity.exoPlayer != null) {
-                                Log.d("AllohaPlayer", "config_update timeout after failover, starting anyway")
-                                configUpdateReceived = true
-                                switchMediaSource(url)
+                                Log.d("AllohaPlayer", "config_update timeout after failover, restarting session")
+                                resumePositionMs = activity.exoPlayer?.currentPosition ?: 0L
+                                resumePlayWhenReady = activity.exoPlayer?.playWhenReady ?: true
+                                parseStream(parser.lastIframeUrl, isRestart = true)
                             }
                         }
                     } else if (configUpdateReceived) {
-                        switchMediaSource(url)
-                        statusText = "Stream URL refreshed"
+                        if (isProactiveRestart) {
+                            isProactiveRestart = false
+                            activity.hlsProxy.updateMasterUrl(url)
+                            Log.d("AllohaPlayer", "Proactive restart: CDN URL updated silently, no player interruption")
+                        } else {
+                            switchMediaSource(url)
+                            statusText = "Stream URL refreshed"
+                        }
                     } else {
                         // Waiting for config_update — but if it never comes, start after timeout
                         coroutineScope.launch {
@@ -394,12 +518,21 @@ fun ParserScreen(modifier: Modifier = Modifier, activity: MainActivity, parser: 
                 }
 
                 override fun onPlayerError(error: androidx.media3.common.PlaybackException) {
-                    val fb = fallbackM3u8Url
-                    if (fb.isNotBlank() && currentM3u8Url != fb) {
-                        Log.d("AllohaPlayer", "CDN error, will switch to fallback when onM3u8Refreshed fires: $fb")
-                        statusText = "CDN error, waiting for backup node..."
-                        configUpdateReceived = false
-                        // Don't switch yet — onM3u8Refreshed will fire with 35d-a13 URL and handle it
+                    Log.d("AllohaPlayer", "Player error: ${error.message}, restarting session")
+                    statusText = "CDN error, restarting..."
+                    val iframe = parser.lastIframeUrl
+                    if (iframe.isNotBlank()) {
+                        // Save position, quality and play state before restart
+                        activity.exoPlayer?.let { p ->
+                            resumePositionMs = p.currentPosition
+                            resumePlayWhenReady = p.playWhenReady
+                            Log.d("AllohaPlayer", "Saving position: ${resumePositionMs}ms quality: $qualityKey playing: $resumePlayWhenReady")
+                        }
+                        resumeQualityKey = qualityKey
+                        coroutineScope.launch {
+                            kotlinx.coroutines.delay(1000)
+                            parseStream(iframe, isRestart = true)
+                        }
                     } else {
                         statusText = "Playback error: ${error.message}"
                     }
@@ -414,8 +547,10 @@ fun ParserScreen(modifier: Modifier = Modifier, activity: MainActivity, parser: 
                     it.addListener(trackOverrideListener)
                 }
 
+            activity.hlsProxy.updateMasterUrl(urlToPlay)
+            val proxiedUrl = activity.hlsProxy.fixedMasterUrl
             val mediaItem = MediaItem.Builder()
-                .setUri(urlToPlay)  // was: .setUri(m3u8Url)
+                .setUri(proxiedUrl)  // route through local proxy
                 .setMimeType(MimeTypes.APPLICATION_M3U8)
                 .build()
             val hlsSource = HlsMediaSource.Factory(factory).createMediaSource(mediaItem)
@@ -434,7 +569,30 @@ fun ParserScreen(modifier: Modifier = Modifier, activity: MainActivity, parser: 
     }
 
     // UI
-    Column(modifier = modifier.padding(16.dp).fillMaxSize().verticalScroll(rememberScrollState())) {
+    val playerView = remember {
+        PlayerView(activity).apply {
+            useController = true
+            keepScreenOn = true
+            setShowSubtitleButton(true)
+            setShowNextButton(false)
+            setShowPreviousButton(false)
+            setShowFastForwardButton(true)
+            setShowRewindButton(true)
+            setShowBuffering(PlayerView.SHOW_BUFFERING_ALWAYS)
+        }
+    }
+    // keep player attached
+    if (activity.exoPlayer != null) playerView.player = activity.exoPlayer
+    playerView.setFullscreenButtonClickListener { entering ->
+        isFullscreen = entering
+        activity.requestedOrientation = if (entering)
+            android.content.pm.ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+        else
+            android.content.pm.ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+    }
+
+    Box(modifier = modifier.fillMaxSize()) {
+    Column(modifier = Modifier.padding(16.dp).fillMaxSize().verticalScroll(rememberScrollState())) {
 
         Box(modifier = Modifier.size(10.dp).alpha(0.01f)) {
             AndroidView(factory = { parser.webView })
@@ -663,22 +821,23 @@ fun ParserScreen(modifier: Modifier = Modifier, activity: MainActivity, parser: 
             Spacer(modifier = Modifier.height(16.dp))
         }
 
-        if (showPlayer) {
+        if (showPlayer && !isFullscreen) {
             AndroidView(
-                factory = { context ->
-                    PlayerView(context).apply {
-                        useController = true
-                        keepScreenOn = true
-                        player = activity.exoPlayer
-                    }
-                },
-                update = { view -> view.player = activity.exoPlayer },
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .aspectRatio(16f / 9f)
+                factory = { playerView },
+                update = { it.player = activity.exoPlayer },
+                modifier = Modifier.fillMaxWidth().aspectRatio(16f / 9f)
             )
         }
 
         Spacer(modifier = Modifier.height(50.dp))
+    } // end Column
+
+    if (isFullscreen && showPlayer) {
+        AndroidView(
+            factory = { playerView },
+            update = { it.player = activity.exoPlayer },
+            modifier = Modifier.fillMaxSize()
+        )
     }
+    } // end Box
 }
