@@ -22,5 +22,5 @@ dependencyResolutionManagement {
     }
 }
 
-rootProject.name = "Alloha parser"
+rootProject.name = "AllohaParser"
 include(":app")
